@@ -1,0 +1,208 @@
+"""
+Monitor: 3x Selec EMDC2M-1CH-C-1RO
+Slave IDs : 1, 3, 5
+Port      : COM8
+Baud      : 19200, None parity, 1 stop bit
+
+Reads each meter one at a time sequentially, then prints
+all three results together on one line. Slight delay between
+reads is fine -- all three values are from the same poll cycle.
+
+Each meter's reading is also POSTed to the backend server
+(UpdateReadingAPIView) right after it is read.
+"""
+
+import minimalmodbus
+import serial
+import struct
+import time
+import csv
+import os
+import requests
+from datetime import datetime
+
+# ======================================================================
+# CONFIGURATION
+# ======================================================================
+
+PORT          = "COM8"
+BAUDRATE      = 9600
+ADDRESSES     = [1, 3, 5]
+POLL_INTERVAL = 2.0       # seconds between full poll cycles
+
+DC_REG_VOLTAGE = 1606
+DC_REG_CURRENT = 1608
+DC_REG_POWER   = 1610
+DC_REG_ENERGY  = 1612
+
+LOGFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DC_3meter_log.csv")
+
+# ---- Server upload configuration ----
+SERVER_URL = "http://<YOUR_SERVER_HOST>:<PORT>/api/update-reading/"  # <-- set your actual endpoint here
+REQUEST_TIMEOUT = 3.0  # seconds, so a slow/unreachable server doesn't stall the polling loop
+
+# Map each Modbus slave address to the controller_id expected by the backend
+# (this must match the `controller_no` field on the Cycle model).
+CONTROLLER_ID_MAP = {
+    1: "CTRL-1",   # <-- replace with your real controller_no for slave address 1
+    3: "CTRL-3",   # <-- replace with your real controller_no for slave address 3
+    5: "CTRL-5",   # <-- replace with your real controller_no for slave address 5
+}
+
+# ======================================================================
+# INSTRUMENT SETUP
+# ======================================================================
+
+def make(addr):
+    inst = minimalmodbus.Instrument(PORT, addr)
+    inst.serial.baudrate = BAUDRATE
+    inst.serial.bytesize = 8
+    inst.serial.parity   = serial.PARITY_NONE
+    inst.serial.stopbits = 1
+    inst.serial.timeout  = 1.0
+    inst.mode = minimalmodbus.MODE_RTU
+    return inst
+
+meters = {addr: make(addr) for addr in ADDRESSES}
+
+# ======================================================================
+# READ ONE METER (sequential, one register at a time with small gap)
+# ======================================================================
+
+def to_float(regs):
+    raw = struct.pack(">I", (regs[0] << 16) | regs[1])
+    return struct.unpack(">f", raw)[0]
+
+def read_one(addr):
+    """
+    Reads voltage, current, power and energy from a single meter.
+    Each register read is separated by a small delay to avoid
+    bus collisions on slow hardware.
+    Returns a dict on success, None on failure.
+    """
+    inst = meters[addr]
+    try:
+        v_regs = inst.read_registers(DC_REG_VOLTAGE, 2, functioncode=3)
+        time.sleep(0.08)
+        i_regs = inst.read_registers(DC_REG_CURRENT, 2, functioncode=3)
+        time.sleep(0.08)
+        p_regs = inst.read_registers(DC_REG_POWER,   2, functioncode=3)
+        time.sleep(0.08)
+        e_regs = inst.read_registers(DC_REG_ENERGY,  2, functioncode=3)
+        time.sleep(0.08)
+        return {
+            "V":   round(to_float(v_regs), 2),
+            "A":   round(to_float(i_regs), 3),
+            "kW":  round(to_float(p_regs), 3),
+            "kWh": round(to_float(e_regs), 3),
+        }
+    except Exception:
+        return None
+
+# ======================================================================
+# SEND ONE METER'S READING TO THE SERVER
+# ======================================================================
+
+def send_to_server(addr, data):
+    """
+    POSTs a single meter's reading to the backend.
+    Field names match what UpdateReadingAPIView expects:
+        controller_id, voltage, amperage, power
+    Returns the parsed JSON response on success, None on failure.
+    """
+    controller_id = CONTROLLER_ID_MAP.get(addr)
+    if controller_id is None:
+        print(f"  [server] No controller_id mapped for address {addr}, skipping upload.")
+        return None
+
+    payload = {
+        "controller_id": controller_id,
+        "voltage": data["V"],
+        "amperage": data["A"],
+        "power": data["kW"],
+    }
+
+    try:
+        resp = requests.post(SERVER_URL, data=payload, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            print(f"  [server] {controller_id} -> HTTP {resp.status_code}: {resp.text[:200]}")
+            return None
+    except requests.exceptions.RequestException as e:
+        print(f"  [server] {controller_id} -> upload failed: {e}")
+        return None
+
+# ======================================================================
+# CSV LOGGING
+# ======================================================================
+
+HEADER = ["Timestamp",
+          "ID1_V","ID1_A","ID1_kW","ID1_kWh",
+          "ID3_V","ID3_A","ID3_kW","ID3_kWh",
+          "ID5_V","ID5_A","ID5_kW","ID5_kWh"]
+
+if not os.path.exists(LOGFILE):
+    with open(LOGFILE, "w", newline="") as f:
+        csv.writer(f).writerow(HEADER)
+
+# ======================================================================
+# MAIN LOOP
+# ======================================================================
+
+print("=" * 80)
+print(f" 3x Selec EMDC2M  |  {PORT}  |  {BAUDRATE} baud  |  Slave IDs: {ADDRESSES}")
+print(f" Reads each meter individually then prints all three together.")
+print(f" Logging to: {LOGFILE}")
+print(f" Uploading to: {SERVER_URL}")
+print("=" * 80)
+print()
+
+# Column header
+print(f"{'Timestamp':<22} | "
+      f"{'ID1 V':>8} {'A':>8} {'kW':>8} {'kWh':>10} | "
+      f"{'ID3 V':>8} {'A':>8} {'kW':>8} {'kWh':>10} | "
+      f"{'ID5 V':>8} {'A':>8} {'kW':>8} {'kWh':>10}")
+print("-" * 105)
+
+try:
+    while True:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Read each meter one at a time with a gap between meters
+        results = {}
+        for addr in ADDRESSES:
+            d = read_one(addr)
+            results[addr] = d
+            if d:
+                send_to_server(addr, d)
+            time.sleep(0.15)   # gap between meters
+
+        # Build display row
+        row = [ts]
+        parts = []
+        for addr in ADDRESSES:
+            d = results[addr]
+            if d:
+                parts.append(f"{d['V']:>8.2f} {d['A']:>8.3f} {d['kW']:>8.3f} {d['kWh']:>10.3f}")
+                row += [d["V"], d["A"], d["kW"], d["kWh"]]
+            else:
+                parts.append(f"{'--':>8} {'--':>8} {'--':>8} {'--':>10}")
+                row += ["", "", "", ""]
+
+        # Print all three on one line
+        print(f"{ts}  | {' | '.join(parts)}")
+
+        # Log to CSV
+        with open(LOGFILE, "a", newline="") as f:
+            csv.writer(f).writerow(row)
+
+        time.sleep(POLL_INTERVAL)
+
+except KeyboardInterrupt:
+    print("\nStopped.")
+    for inst in meters.values():
+        try:
+            inst.serial.close()
+        except Exception:
+            pass

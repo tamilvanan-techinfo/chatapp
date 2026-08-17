@@ -1,0 +1,56 @@
+# ---- Secrets / environment ----
+.env
+.env.*
+!.env.example
+
+# ---- Python (FastAPI backend) ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+*.sqlite3
+*.db
+
+# Transient file-transfer spool (TTL-deleted at runtime, never commit)
+tmp_transfer/
+
+# ---- Node / React / Electron ----
+node_modules/
+dist/
+build/
+out/
+.vite/
+.parcel-cache/
+
+# Local Electron chat cache (SQLite DB + cached files) — lives under
+# app.getPath("userData") at runtime, but ignore here too in case any
+# local dev paths land inside the repo (e.g. ./data, ./chat_files).
+data/
+chat_files/
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+
+# ---- Logs ----
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ---- OS / editor cruft ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# ---- Electron packaging output ----
+out/
+release/
+*.exe
+*.dmg
+*.AppImage
