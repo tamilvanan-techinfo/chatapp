@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,6 +25,27 @@ class Settings(BaseSettings):
     file_ttl_seconds: int = 3600
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # Some hosts (Vercel, etc.) let an env var exist but be set to an empty
+    # string rather than truly unset — pydantic treats that as "value = ''"
+    # and fails int parsing instead of falling back to the default. Treat
+    # blank as "not provided" for these two so a stray empty env var in the
+    # dashboard doesn't crash the whole app on boot. Returning the concrete
+    # default here (not None) since these fields are plain `int`, not
+    # `Optional[int]`.
+    @field_validator("access_token_expire_minutes", mode="before")
+    @classmethod
+    def _blank_expire_minutes(cls, value):
+        if isinstance(value, str) and value.strip() == "":
+            return 60
+        return value
+
+    @field_validator("file_ttl_seconds", mode="before")
+    @classmethod
+    def _blank_ttl_seconds(cls, value):
+        if isinstance(value, str) and value.strip() == "":
+            return 3600
+        return value
 
 
 settings = Settings()
